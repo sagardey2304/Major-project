@@ -10,6 +10,7 @@ import torch.nn as nn
 import time
 from typing import Dict, Any, List, Tuple
 from dataclasses import dataclass
+import os
 
 from .base_agent import BaseAgent, Message, MessageType
 
@@ -51,7 +52,7 @@ class PerceptionAgent(BaseAgent):
         self.config = config or {}
         self.proximity_threshold = self.config.get('proximity_threshold', 2.0)
         self.confidence_threshold = self.config.get('confidence_threshold', 0.7)  # Increased to reduce false positives
-        self.camera_index = self.config.get('camera_index', 1)
+        self.camera_index = self.config.get('camera_index', )
         self.frame_width = self.config.get('frame_width', 640)
         self.frame_height = self.config.get('frame_height', 480)
         
@@ -108,22 +109,36 @@ class PerceptionAgent(BaseAgent):
             }, priority=3)
             
     def _init_camera(self):
-        """Initialize camera capture"""
-        try:
-            self.cap = cv2.VideoCapture(self.camera_index)
-            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.frame_width)
-            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.frame_height)
-            
-            if not self.cap.isOpened():
-                raise RuntimeError(f"Cannot open camera {self.camera_index}")
-                
-            print(f"[{self.agent_name}] Camera initialized successfully")
-            
-        except Exception as e:
-            print(f"[{self.agent_name}] Error initializing camera: {e}")
+        """Robust, cross-platform camera initialization"""
+        backends = []
+        if os.name == 'nt':
+            # Windows
+            backends = [cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_VFW]
+        elif sys.platform == 'darwin':
+            # macOS
+            backends = [cv2.CAP_AVFOUNDATION, cv2.CAP_ANY]
+        else:
+            # Linux (and others)
+            backends = [cv2.CAP_V4L2, cv2.CAP_ANY]
+        success = False
+        for backend in backends:
+            try:
+                self.cap = cv2.VideoCapture(self.camera_index, backend)
+                self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.frame_width)
+                self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.frame_height)
+                if self.cap.isOpened():
+                    print(f"[{self.agent_name}] Camera initialized (index={self.camera_index}, backend={backend})")
+                    success = True
+                    break
+                else:
+                    self.cap.release()
+            except Exception as e:
+                print(f"[{self.agent_name}] Could not initialize camera with backend {backend}: {e}")
+        if not success:
+            print(f"[{self.agent_name}] ERROR: Cannot open camera index={self.camera_index} with any tested backend.")
             self.send_message(MessageType.SYSTEM_STATUS, {
                 'status': 'error',
-                'message': f'Camera initialization failed: {e}'
+                'message': f'Camera initialization failed for index {self.camera_index}'
             }, priority=3)
             
     def _get_warning_level(self, distance_meters):

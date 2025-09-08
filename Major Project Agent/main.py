@@ -39,28 +39,39 @@ def _detect_device():
 
 
 def find_working_camera_index(preferred_index: int = 0, max_search: int = 5) -> int:
-    """Find a working camera index, fallback to search if preferred fails."""
+    """Find a working camera index, testing multiple OpenCV backends for cross-device compatibility."""
+    backends = []
+    if os.name == 'nt':
+        backends = [cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_VFW]
+    else:
+        backends = [cv2.CAP_V4L2, cv2.CAP_AVFOUNDATION, cv2.CAP_ANY]
+    
     def _is_open(idx):
-        cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW if os.name == 'nt' else cv2.CAP_ANY)
-        ok = cap.isOpened()
-        if ok:
-            ret, _ = cap.read()
+        for backend in backends:
+            cap = cv2.VideoCapture(idx, backend)
+            ok = cap.isOpened()
+            if ok:
+                ret, _ = cap.read()
+                cap.release()
+                if ret:
+                    print(f"[camera] Opened with index {idx} and backend {backend}")
+                    return True
             cap.release()
-            return ret or ok
-        cap.release()
         return False
 
+    # Try preferred index first
     if preferred_index is not None and isinstance(preferred_index, int):
         if _is_open(preferred_index):
             print(f"[camera] Using preferred camera index: {preferred_index}")
             return preferred_index
 
+    # Search all indexes
     for idx in range(max_search):
         if _is_open(idx):
             print(f"[camera] Found working camera at index: {idx}")
             return idx
 
-    print(f"[camera] No working camera detected in range 0..{max_search - 1}")
+    print(f"[camera] No working camera detected in range 0..{max_search-1} using tested backends")
     return -1
 
 
