@@ -111,7 +111,7 @@ class NavigationAgent(BaseAgent):
         
         # ReAct/LLM Configuration
         self.use_react = self.config.get('use_react', True)  # Enable/disable ReAct
-        self.ollama_model = self.config.get('ollama_model', 'llama2')
+        self.ollama_model = self.config.get('ollama_model', 'gpt-oss')
         self.ollama_url = self.config.get('ollama_url', 'http://localhost:11434')
         self.use_fallback = self.config.get('use_fallback', True)
         
