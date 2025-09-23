@@ -42,7 +42,7 @@ class CommunicationAgent(BaseAgent):
         self.visual_enabled = self.config.get('visual_enabled', True)
         self.speech_rate = self.config.get('speech_rate', 160)
         self.speech_volume = self.config.get('speech_volume', 0.8)
-        self.delay_seconds = self.config.get('delay_seconds', 4)
+        self.delay_seconds = self.config.get('delay_seconds', 2)
         
         # TTS Setup
         self._init_tts()

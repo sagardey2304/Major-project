@@ -73,9 +73,9 @@ class PerceptionAgent(BaseAgent):
         
         # Distance-based warning thresholds (in meters)
         self.distance_thresholds = {
-            'critical': 1.5,    # Immediate danger
-            'warning': 3.0,     # Warning zone
-            'caution': 5.0      # Caution zone
+            'critical': 1.0,    # Immediate danger
+            'warning': 2.0,     # Warning zone
+            'caution': 3.0      # Caution zone
         }
         
         # Detection tracking for real-time validation
@@ -344,7 +344,7 @@ class PerceptionAgent(BaseAgent):
                         'bbox': detection.bbox,
                         'center': detection.center,
                         'alert_type': 'CRITICAL - IMMEDIATE DANGER'
-                    }, priority=3)
+                    }, priority=4)
                 
                 for detection in warning_detections:
                     self.send_message(MessageType.OBSTACLE_ALERT, {
@@ -356,7 +356,7 @@ class PerceptionAgent(BaseAgent):
                         'bbox': detection.bbox,
                         'center': detection.center,
                         'alert_type': 'WARNING - APPROACHING OBSTACLE'
-                    }, priority=2)
+                    }, priority=3)
                 
                 for detection in caution_detections:
                     self.send_message(MessageType.OBSTACLE_ALERT, {
@@ -368,7 +368,7 @@ class PerceptionAgent(BaseAgent):
                         'bbox': detection.bbox,
                         'center': detection.center,
                         'alert_type': 'CAUTION - OBJECT DETECTED'
-                    }, priority=1)
+                    }, priority=2)
                 
                 # Send all detections for navigation processing
                 self.send_message(MessageType.SYSTEM_STATUS, {
