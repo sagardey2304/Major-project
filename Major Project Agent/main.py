@@ -90,7 +90,7 @@ class NavigationSystem:
         self.current_fps = 0
         self.current_frame = None
         self.current_detections = []
-        self.depth_map = None
+        
 
         # Handle OS signals
         signal.signal(signal.SIGINT, self._signal_handler)
@@ -184,8 +184,6 @@ class NavigationSystem:
         print("[main] Starting visualization loop... Press 'q' to quit")
         try:
             cv2.namedWindow(self.config.window_names['main'], cv2.WINDOW_AUTOSIZE)
-            if self.config.show_depth_map:
-                cv2.namedWindow(self.config.window_names['depth'], cv2.WINDOW_AUTOSIZE)
         except Exception as e:
             print(f"[main] Could not create OpenCV windows: {e}")
 
@@ -195,9 +193,7 @@ class NavigationSystem:
                     frame = self.perception_agent.get_current_frame()
                     if frame is not None:
                         self.current_frame = frame
-                    depth_map = self.perception_agent.get_current_depth_map()
-                    if depth_map is not None:
-                        self.depth_map = depth_map
+                    
 
                 display_frame = self.current_frame
                 if display_frame is not None and self.communication_agent:
@@ -210,10 +206,7 @@ class NavigationSystem:
                         self._draw_fps(display_frame)
                     cv2.imshow(self.config.window_names['main'], display_frame)
 
-                if self.config.show_depth_map and self.depth_map is not None:
-                    normalized_depth = cv2.normalize(self.depth_map, None, 0, 255, cv2.NORM_MINMAX)
-                    depth_visual = cv2.applyColorMap(normalized_depth.astype(np.uint8), cv2.COLORMAP_MAGMA)
-                    cv2.imshow(self.config.window_names['depth'], depth_visual)
+                
 
                 self._update_fps()
 
@@ -237,8 +230,8 @@ class NavigationSystem:
         try:
             zone_colors = {'critical': (0, 0, 255), 'warning': (0, 165, 255),
                            'caution': (0, 255, 255), 'safe': (0, 255, 0)}
-            zones = [('critical', '≤1.5m', 'CRITICAL'), ('warning', '≤3.0m', 'WARNING'),
-                     ('caution', '≤5.0m', 'CAUTION'), ('safe', '>5.0m', 'SAFE')]
+            zones = [('critical', '≤1m', 'CRITICAL'), ('warning', '2≤m', 'WARNING'),
+                     ('caution', '≤3m', 'CAUTION'), ('safe', '>3m', 'SAFE')]
             zone_counts = {z: 0 for z in zone_colors}
             for d in self.current_detections:
                 zone_counts[d.get('warning_level', 'safe')] += 1
