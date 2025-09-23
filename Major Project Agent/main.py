@@ -38,7 +38,7 @@ def _detect_device():
         return "cpu"
 
 
-def find_working_camera_index(preferred_index: int = 0, max_search: int = 5) -> int:
+def find_working_camera_index(preferred_index: int = 1, max_search: int = 5) -> int:
     """Find a working camera index, fallback to search if preferred fails."""
     def _is_open(idx):
         cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW if os.name == 'nt' else cv2.CAP_ANY)
