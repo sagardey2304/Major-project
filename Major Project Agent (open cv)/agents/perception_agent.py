@@ -145,7 +145,7 @@ class PerceptionAgent(BaseAgent):
         """Initialize computer vision models - USING ULTRALYTICS YOLO"""
         try:
             # Load YOLOv8s model using ultralytics (SAME AS ORIGINAL CODE)
-            self.yolo_model = YOLO("yolov8s.pt")
+            self.yolo_model = YOLO("yolov5n.pt")
             print(f"[{self.name}] YOLOv8s model initialized successfully with ultralytics")
             
             # COCO class names - EXACTLY THE SAME as PyTorch version
