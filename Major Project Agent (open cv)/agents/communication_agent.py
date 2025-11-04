@@ -1,5 +1,5 @@
 """
-Communication Agent - Highlight closest object with special bounding box
+Communication Agent - Proper movement and distance change communication
 """
 
 import cv2
@@ -19,7 +19,7 @@ except ImportError:
 
 class CommunicationAgent(BaseAgent):
     """
-    Communication Agent that highlights the closest object
+    Communication Agent that properly reports movement and distance changes
     """
 
     def __init__(self, message_bus: MessageBus, config: Dict[str, Any]):
@@ -27,49 +27,68 @@ class CommunicationAgent(BaseAgent):
 
         # Configuration
         self.tts_enabled = config.get('tts_enabled', True) and TTS_AVAILABLE
-        self.speech_rate = config.get('speech_rate', 150)
+        self.speech_rate = config.get('speech_rate', 160)
+        self.movement_report_interval = config.get('movement_report_interval', 2.0)
         
+        # State tracking
+        self.last_reported_distance = None
+        self.last_reported_direction = None
+        self.last_movement_report = 0
+        self.last_object_state = ""
+        self.current_instruction = ""
+        self.closest_object = None
+        self.display_lock = threading.Lock()
+
         # TTS engine
         self.tts_engine = None
         if self.tts_enabled:
             self._initialize_tts()
             
-        # Message queue
+        # Message queues
         self.tts_queue = queue.Queue()
-        self.last_announcement = ""
-        
-        # Current instruction and closest object
-        self.current_instruction = ""
-        self.closest_object = None
-        self.display_lock = threading.Lock()
+        self.urgent_queue = queue.Queue()
 
         # Subscribe to messages
-        self.message_bus.subscribe(MessageType.NAVIGATION_UPDATE, self.handle_message)
+        self.message_bus.subscribe(MessageType.NAVIGATION_UPDATE, self.handle_navigation_message)
         self.message_bus.subscribe(MessageType.SYSTEM_STATUS, self.handle_system_message)
+        self.message_bus.subscribe(MessageType.OBSTACLE_ALERT, self.handle_obstacle_message)
 
     def _initialize_tts(self):
         """Initialize TTS"""
         try:
             self.tts_engine = pyttsx3.init()
             self.tts_engine.setProperty('rate', self.speech_rate)
-            print(f"[{self.name}] TTS initialized")
+            print(f"[{self.name}] TTS initialized for movement reporting")
         except Exception as e:
             print(f"[{self.name}] TTS failed: {e}")
             self.tts_enabled = False
 
     def _run(self):
-        """Main communication loop"""
-        print(f"[{self.name}] Communication loop started - Highlighting closest object")
+        """Main communication loop with movement reporting"""
+        print(f"[{self.name}] Starting communication with movement reporting...")
         
         while self._running:
             try:
-                # Process TTS queue
-                if self.tts_enabled:
+                current_time = time.time()
+                
+                # Process urgent messages first
+                if not self.urgent_queue.empty():
                     try:
-                        message = self.tts_queue.get(timeout=0.1)
+                        message = self.urgent_queue.get_nowait()
                         self._speak(message)
                     except queue.Empty:
                         pass
+                
+                # Process regular messages
+                if not self.tts_queue.empty():
+                    try:
+                        message = self.tts_queue.get_nowait()
+                        self._speak(message)
+                    except queue.Empty:
+                        pass
+                
+                # Continuous movement and distance reporting
+                self._report_movement_and_changes(current_time)
                 
                 time.sleep(0.05)
                 
@@ -79,190 +98,218 @@ class CommunicationAgent(BaseAgent):
         
         print(f"[{self.name}] Communication loop stopped")
 
-    def handle_message(self, message: Message):
-        """Handle navigation updates"""
-        if message.type == MessageType.NAVIGATION_UPDATE:
-            instruction = message.data.get('instruction', '')
-            priority = message.priority
+    def handle_navigation_message(self, message: Message):
+        """Handle navigation instructions"""
+        instruction = message.data.get('instruction', '')
+        priority = message.priority
+        
+        if instruction and instruction != self.current_instruction:
+            print(f"[{self.name}] 🎯 {instruction}")
             
-            if instruction and instruction != self.last_announcement:
-                print(f"[{self.name}] 🎯 {instruction}")
-                
-                # Update current instruction
-                with self.display_lock:
-                    self.current_instruction = instruction
-                
-                # Speak important instructions
-                if priority >= 2:
-                    self._queue_tts(instruction)
-                
-                self.last_announcement = instruction
+            with self.display_lock:
+                self.current_instruction = instruction
+            
+            if priority >= 3:
+                self.urgent_queue.put(instruction)
+            else:
+                self.tts_queue.put(instruction)
 
     def handle_system_message(self, message: Message):
-        """Handle system status for closest object"""
+        """Handle system status with movement information"""
         if message.type == MessageType.SYSTEM_STATUS:
             data = message.data
             if data.get('status') == 'perception_update':
                 with self.display_lock:
                     self.closest_object = data.get('closest_object')
+                    
+                    # Check for movement in the environment
+                    if data.get('movement_detected', False):
+                        print(f"[{self.name}] Movement detected in scene")
 
-    def _queue_tts(self, message: str):
-        """Queue message for TTS"""
-        if self.tts_enabled:
-            self.tts_queue.put(message)
+    def handle_obstacle_message(self, message: Message):
+        """Handle obstacle alerts with movement context"""
+        obstacle_data = message.data
+        distance = obstacle_data.get('distance', 0)
+        direction = obstacle_data.get('direction', 'ahead')
+        is_moving = obstacle_data.get('is_moving', False)
+        movement_type = obstacle_data.get('movement_type', 'stationary')
+        
+        # Create context-aware alert message
+        if is_moving:
+            if movement_type == 'moving':
+                alert_msg = f"Moving object {direction} at {distance} meters"
+            elif movement_type == 'changing_distance':
+                if distance < self.last_reported_distance if self.last_reported_distance else distance:
+                    alert_msg = f"Object approaching {direction} now at {distance} meters"
+                else:
+                    alert_msg = f"Object moving away {direction} now at {distance} meters"
+            else:
+                alert_msg = f"Object {direction} at {distance} meters"
+        else:
+            alert_msg = f"Stationary object {direction} at {distance} meters"
+        
+        self.urgent_queue.put(alert_msg)
+
+    def _report_movement_and_changes(self, current_time: float):
+        """Report movement and distance changes"""
+        with self.display_lock:
+            closest_obj = self.closest_object
+        
+        if not closest_obj:
+            # No object detected
+            if self.last_object_state != "clear":
+                message = "Path clear, no objects detected"
+                self.tts_queue.put(message)
+                self.last_object_state = "clear"
+                self.last_reported_distance = None
+                self.last_reported_direction = None
+            return
+        
+        distance = closest_obj.get('distance', 0)
+        direction = closest_obj.get('direction', 'ahead')
+        is_moving = closest_obj.get('is_moving', False)
+        distance_changed = closest_obj.get('distance_changed', False)
+        direction_changed = closest_obj.get('direction_changed', False)
+        
+        # Check if we should report (time-based or change-based)
+        should_report = False
+        report_message = ""
+        
+        # Report based on changes
+        if distance_changed or direction_changed:
+            if is_moving:
+                if distance < (self.last_reported_distance or 10):
+                    report_message = f"Object moving closer {direction}, now {distance} meters"
+                else:
+                    report_message = f"Object moving away {direction}, now {distance} meters"
+            else:
+                report_message = f"Object {direction} at {distance} meters"
+            should_report = True
+        
+        # Report moving objects periodically
+        elif is_moving and (current_time - self.last_movement_report >= self.movement_report_interval):
+            report_message = f"Moving object {direction} at {distance} meters"
+            should_report = True
+            self.last_movement_report = current_time
+        
+        # Report significant distance changes
+        elif (self.last_reported_distance is not None and 
+              abs(distance - self.last_reported_distance) > 0.5):
+            if distance < self.last_reported_distance:
+                report_message = f"Object getting closer, now {distance} meters"
+            else:
+                report_message = f"Object moving away, now {distance} meters"
+            should_report = True
+        
+        # Report if this is a new object state
+        current_state = f"{direction}_{distance:.1f}"
+        if current_state != self.last_object_state:
+            if not should_report:  # Only report if not already reporting
+                report_message = f"Object {direction} at {distance} meters"
+                should_report = True
+        
+        # Speak the report if needed
+        if should_report and report_message:
+            self.tts_queue.put(report_message)
+            print(f"[{self.name}] 📢 {report_message}")
+            
+            # Update tracking state
+            self.last_reported_distance = distance
+            self.last_reported_direction = direction
+            self.last_object_state = current_state
 
     def _speak(self, message: str):
         """Speak message"""
+        if not self.tts_enabled or not self.tts_engine:
+            return
+        
         try:
-            if self.tts_engine:
-                self.tts_engine.say(message)
-                self.tts_engine.runAndWait()
+            self.tts_engine.say(message)
+            self.tts_engine.runAndWait()
         except Exception as e:
             print(f"[{self.name}] TTS error: {e}")
 
     def process_frame(self, frame: np.ndarray, detections: List[Dict[str, Any]]) -> np.ndarray:
-        """Create display with highlighted closest object"""
+        """Create display with movement information"""
         display_frame = frame.copy()
         height, width = display_frame.shape[:2]
         
-        # Draw all detection boxes
+        # Draw detections with movement info
         for detection in detections:
             bbox = detection.get('bbox', [])
             if len(bbox) == 4:
                 x, y, w, h = bbox
                 
-                # Color based on whether it's the closest object
-                if detection.get('is_closest', False):
-                    # HIGHLIGHT closest object with thick red box
-                    color = (0, 0, 255)  # Bright red
-                    thickness = 4
-                    
-                    # Draw highlighted bounding box
-                    cv2.rectangle(display_frame, (x, y), (x + w, y + h), color, thickness)
-                    
-                    # Draw distance label with background
-                    label = f"CLOSEST: {detection.get('distance', 0):.1f}m"
-                    label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
-                    cv2.rectangle(display_frame, (x, y - label_size[1] - 10), 
-                                (x + label_size[0], y), color, -1)
-                    cv2.putText(display_frame, label, (x, y - 5), 
-                              cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-                    
-                    # Draw direction arrow
-                    direction = detection.get('direction', 'center')
-                    self._draw_direction_indicator(display_frame, x + w//2, y, direction)
-                    
+                # Color based on movement
+                if detection.get('is_moving', False):
+                    color = (0, 165, 255)  # Orange for moving objects
+                    thickness = 3
+                elif detection.get('is_closest', False):
+                    color = (0, 0, 255)  # Red for closest
+                    thickness = 3
                 else:
-                    # Regular objects with thinner boxes
-                    color_map = {
-                        'critical': (0, 0, 255),
-                        'warning': (0, 165, 255),  
-                        'caution': (0, 255, 255),
-                        'safe': (0, 255, 0)
-                    }
-                    color = color_map.get(detection.get('warning_level', 'safe'), (0, 255, 0))
-                    thickness = 2
-                    
-                    cv2.rectangle(display_frame, (x, y), (x + w, y + h), color, thickness)
-                    
-                    # Simple distance label for regular objects
-                    label = f"{detection.get('distance', 0):.1f}m"
-                    cv2.putText(display_frame, label, (x, y - 10), 
-                              cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                    color = (0, 255, 0)  # Green for stationary
+                    thickness = 1
+                
+                cv2.rectangle(display_frame, (x, y), (x + w, y + h), color, thickness)
+                
+                # Label with distance and movement info
+                distance = detection.get('distance', 0)
+                label = f"{distance:.1f}m"
+                if detection.get('is_moving', False):
+                    label += " MOVING"
+                
+                cv2.putText(display_frame, label, (x, y - 10), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
         
-        # Draw navigation path
-        center_x = width // 2
-        path_left = center_x - 150
-        path_right = center_x + 150
-        cv2.rectangle(display_frame, (path_left, 0), (path_right, height), (255, 255, 255), 2)
-        
-        # Draw UI elements
-        self._draw_distance_zones(display_frame)
-        self._draw_instruction(display_frame)
-        self._draw_closest_object_info(display_frame)
-        
-        # Draw FPS
-        cv2.putText(display_frame, f"FPS: {self._get_fps()}", (width - 100, 30),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        # Draw UI
+        self._draw_movement_ui(display_frame)
         
         return display_frame
 
-    def _draw_direction_indicator(self, frame: np.ndarray, x: int, y: int, direction: str):
-        """Draw direction indicator for closest object"""
-        if direction == 'left':
-            # Left arrow
-            points = np.array([[x, y-20], [x-15, y], [x, y+20]], np.int32)
-            cv2.fillPoly(frame, [points], (0, 0, 255))
-        elif direction == 'right':
-            # Right arrow  
-            points = np.array([[x, y-20], [x+15, y], [x, y+20]], np.int32)
-            cv2.fillPoly(frame, [points], (0, 0, 255))
-        else:
-            # Center - circle
-            cv2.circle(frame, (x, y), 10, (0, 0, 255), -1)
-
-    def _draw_closest_object_info(self, frame: np.ndarray):
-        """Display information about the closest object"""
+    def _draw_movement_ui(self, frame: np.ndarray):
+        """Draw movement-aware user interface"""
+        height, width = frame.shape[:2]
+        
+        # Top status bar
+        cv2.rectangle(frame, (0, 0), (width, 40), (0, 0, 0), -1)
+        
         with self.display_lock:
             closest_obj = self.closest_object
-        
-        if closest_obj:
-            distance = closest_obj.get('distance', 0)
-            direction = closest_obj.get('direction', 'unknown')
-            in_path = closest_obj.get('in_path', False)
-            
-            info_text = f"Closest: {distance}m {direction}"
-            if in_path:
-                info_text += " (IN PATH)"
-            
-            cv2.putText(frame, info_text, (10, 30), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-
-    def _draw_distance_zones(self, frame: np.ndarray):
-        """Draw distance zones"""
-        zones = [
-            ('🚨 CRITICAL <1.5m', (0, 0, 255)),
-            ('⚠️ WARNING <3.0m', (0, 165, 255)),
-            ('🟡 CAUTION <5.0m', (0, 255, 255)),
-            ('✅ SAFE >5.0m', (0, 255, 0))
-        ]
-        
-        for i, (text, color) in enumerate(zones):
-            y = 60 + i * 25
-            cv2.putText(frame, text, (10, y), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-
-    def _draw_instruction(self, frame: np.ndarray):
-        """Draw current navigation instruction"""
-        with self.display_lock:
             instruction = self.current_instruction
         
+        # Status text
+        if closest_obj:
+            distance = closest_obj.get('distance', 0)
+            direction = closest_obj.get('direction', 'ahead')
+            is_moving = closest_obj.get('is_moving', False)
+            
+            if is_moving:
+                status_text = f"MOVING OBJECT {direction} at {distance}m"
+                color = (0, 165, 255)  # Orange
+            else:
+                status_text = f"OBJECT {direction} at {distance}m"
+                color = (0, 0, 255)  # Red
+        else:
+            status_text = "NO OBJECTS DETECTED"
+            color = (0, 255, 0)  # Green
+        
+        cv2.putText(frame, status_text, (10, 25), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+        
+        # FPS
+        fps = self._get_fps()
+        cv2.putText(frame, f"FPS: {fps}", (width - 80, 25),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        
+        # Current instruction
         if instruction:
-            # Draw instruction background
-            y_start = frame.shape[0] - 100
-            cv2.rectangle(frame, (0, y_start), (frame.shape[1], frame.shape[0]), (0, 0, 0), -1)
-            
-            # Draw instruction text (split if too long)
-            words = instruction.split()
-            lines = []
-            current_line = ""
-            
-            for word in words:
-                if len(current_line + word) < 40:
-                    current_line += " " + word
-                else:
-                    lines.append(current_line.strip())
-                    current_line = word
-            if current_line:
-                lines.append(current_line.strip())
-            
-            for i, line in enumerate(lines):
-                y = y_start + 30 + i * 25
-                cv2.putText(frame, line, (10, y), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            cv2.rectangle(frame, (0, height-40), (width, height), (0, 0, 0), -1)
+            cv2.putText(frame, instruction, (10, height-10), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
     def _get_fps(self) -> int:
-        """Simple FPS counter"""
+        """Get FPS"""
         if not hasattr(self, 'fps_counter'):
             self.fps_counter = 0
             self.fps_timer = time.time()
@@ -278,8 +325,7 @@ class CommunicationAgent(BaseAgent):
 
     def send_user_message(self, message: str, priority: int = 1):
         """Send user message"""
-        self.send_message(
-            MessageType.USER_COMMUNICATION,
-            {'message': message},
-            priority=priority
-        )
+        if priority >= 3:
+            self.urgent_queue.put(message)
+        else:
+            self.tts_queue.put(message)
