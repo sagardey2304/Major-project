@@ -5,6 +5,7 @@ Using calibrated camera for accurate distance estimation
 import cv2
 import numpy as np
 import time
+import os
 from typing import Dict, Any, List, Tuple
 from dataclasses import dataclass
 
@@ -87,17 +88,58 @@ class PerceptionAgent(BaseAgent):
         self.message_bus.subscribe(MessageType.SYSTEM_STATUS, self.handle_message)
         
     def _load_calibration_data(self):
-        """Load camera calibration data - EXACTLY THE SAME"""
-        try:
-            data = np.load("calib_data.npz")
-            self.camera_matrix = data["camera_matrix"]
-            self.dist_coeffs = data["dist_coeffs"]
-            print(f"[{self.name}] Camera calibration data loaded successfully")
-        except Exception as e:
-            print(f"[{self.name}] Error loading calibration data: {e}")
-            # Fallback to default values if calibration fails
-            self.camera_matrix = np.array([[800, 0, 320], [0, 800, 240], [0, 0, 1]])
-            self.dist_coeffs = np.zeros(5)
+        """Load camera calibration data - IMPROVED PATH HANDLING"""
+        # Try multiple possible locations for the calibration file
+        possible_paths = [
+            "calib_data.npz",  # Current directory
+            "./calib_data.npz",  # Current directory explicitly
+            "models/calib_data.npz",  # models subdirectory
+            "../calib_data.npz",  # Parent directory
+        ]
+        
+        calibration_file = None
+        for path in possible_paths:
+            if os.path.exists(path):
+                calibration_file = path
+                break
+        
+        if calibration_file:
+            try:
+                data = np.load(calibration_file)
+                self.camera_matrix = data["camera_matrix"]
+                self.dist_coeffs = data["dist_coeffs"]
+                print(f"[{self.name}] Camera calibration data loaded successfully from {calibration_file}")
+                print(f"[{self.name}] Camera matrix: {self.camera_matrix}")
+                print(f"[{self.name}] Distortion coefficients: {self.dist_coeffs}")
+                return
+            except Exception as e:
+                print(f"[{self.name}] Error loading calibration from {calibration_file}: {e}")
+        
+        # If we get here, no calibration file was found or loaded successfully
+        print(f"[{self.name}] No calibration file found in expected locations, using default calibration")
+        self._create_default_calibration()
+    
+    def _create_default_calibration(self):
+        """Create default camera calibration parameters"""
+        # Default camera matrix for a typical webcam
+        # Assuming focal length of ~800 pixels for 640x480 resolution
+        fx = 800.0  # focal length in x direction
+        fy = 800.0  # focal length in y direction
+        cx = self.frame_width / 2.0   # principal point x
+        cy = self.frame_height / 2.0  # principal point y
+        
+        self.camera_matrix = np.array([
+            [fx, 0, cx],
+            [0, fy, cy],
+            [0, 0, 1]
+        ], dtype=np.float32)
+        
+        # Default distortion coefficients (usually small for modern cameras)
+        self.dist_coeffs = np.array([0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        
+        print(f"[{self.name}] Default calibration created:")
+        print(f"[{self.name}]   Focal length: {fx}")
+        print(f"[{self.name}]   Principal point: ({cx}, {cy})")
             
     def _init_models(self):
         """Initialize computer vision models - USING ULTRALYTICS YOLO"""

@@ -1,331 +1,346 @@
 """
-Communication Agent - Proper movement and distance change communication
+Communication Agent - Handles TTS functionality and user interface
+(continuous speech + scenario-change feedback + lagged TTS + bounding boxes)
 """
+import time
+import threading
+import re
+from queue import Queue, Empty
+from typing import Dict, Any, List, Optional, Tuple
+from dataclasses import dataclass
 
 import cv2
 import numpy as np
-import time
-import threading
-import queue
-from typing import Dict, Any, List
+import pyttsx3
 
-from .base_agent import BaseAgent, MessageBus, MessageType, Message
+from .base_agent import BaseAgent, Message, MessageType
 
-try:
-    import pyttsx3
-    TTS_AVAILABLE = True
-except ImportError:
-    TTS_AVAILABLE = False
+
+@dataclass
+class AudioMessage:
+    text: str
+    priority: int
+    timestamp: float
+    voice_settings: Optional[Dict[str, Any]] = None
+
+
+@dataclass
+class VisualAlert:
+    message: str
+    alert_type: str
+    duration: float
+    position: Tuple[int, int]
+    timestamp: float
+    spoken: bool = False
+
 
 class CommunicationAgent(BaseAgent):
-    """
-    Communication Agent that properly reports movement and distance changes
-    """
-
-    def __init__(self, message_bus: MessageBus, config: Dict[str, Any]):
+    def __init__(self, message_bus, config: Dict[str, Any] = None):
+        # FIX: Pass config to parent class
+        config = config or {}
         super().__init__("CommunicationAgent", message_bus, config)
 
-        # Configuration
-        self.tts_enabled = config.get('tts_enabled', True) and TTS_AVAILABLE
-        self.speech_rate = config.get('speech_rate', 160)
-        self.movement_report_interval = config.get('movement_report_interval', 2.0)
-        
-        # State tracking
-        self.last_reported_distance = None
-        self.last_reported_direction = None
-        self.last_movement_report = 0
-        self.last_object_state = ""
-        self.current_instruction = ""
-        self.closest_object = None
-        self.display_lock = threading.Lock()
+        # Config
+        self.config = config
+        self.tts_enabled = self.config.get("tts_enabled", True)
+        self.visual_enabled = self.config.get("visual_enabled", True)
+        self.speech_rate = self.config.get("speech_rate", 160)
+        self.speech_volume = self.config.get("speech_volume", 0.8)
+        self.delay_seconds = self.config.get("delay_seconds", 4)
+        self.status_update_interval = self.config.get("status_update_interval", 10)
 
-        # TTS engine
+        self.display_config = self.config.get(
+            "display",
+            {
+                "width": 640,
+                "height": 480,
+                "font_scale": 0.8,
+                "font_thickness": 2,
+                "alert_duration": 4.0,
+            },
+        )
+
+        # TTS setup
         self.tts_engine = None
-        if self.tts_enabled:
-            self._initialize_tts()
-            
-        # Message queues
-        self.tts_queue = queue.Queue()
-        self.urgent_queue = queue.Queue()
+        self.tts_lock = threading.Lock()
+        self._default_voice = None
+        self._default_rate = self.speech_rate
+        self._default_volume = self.speech_volume
+        self._init_tts()
 
-        # Subscribe to messages
-        self.message_bus.subscribe(MessageType.NAVIGATION_UPDATE, self.handle_navigation_message)
-        self.message_bus.subscribe(MessageType.SYSTEM_STATUS, self.handle_system_message)
-        self.message_bus.subscribe(MessageType.OBSTACLE_ALERT, self.handle_obstacle_message)
+        # Queues
+        self.audio_queue: "Queue[AudioMessage]" = Queue()
+        self.visual_alerts: List[VisualAlert] = []
 
-    def _initialize_tts(self):
-        """Initialize TTS"""
+        # State
+        self.last_spoken_time = time.time()
+        self.last_spoken_message = ""
+        self.last_detection_state = None
+        self.current_detection_summary = {"critical": 0, "warning": 0, "caution": 0, "safe": 0}
+        self.last_status_update = 0.0
+
+        # Subscribe
+        self.message_bus.subscribe(MessageType.OBSTACLE_ALERT, self.handle_message)
+        self.message_bus.subscribe(MessageType.NAVIGATION_UPDATE, self.handle_message)
+        self.message_bus.subscribe(MessageType.SYSTEM_STATUS, self.handle_message)
+        self.message_bus.subscribe(MessageType.USER_COMMUNICATION, self.handle_message)
+
+        # Worker
+        self.tts_worker_running = True
+        self.tts_worker_thread = threading.Thread(target=self._tts_worker, name="TTSWorker")
+        self.tts_worker_thread.start()
+
+        print(f"[{self.name}] Communication Agent initialized")  # FIX: Use self.name
+
+    # -------------------- TTS --------------------
+    def _init_tts(self):
+        """Initialize TTS engine"""
         try:
-            self.tts_engine = pyttsx3.init()
-            self.tts_engine.setProperty('rate', self.speech_rate)
-            print(f"[{self.name}] TTS initialized for movement reporting")
+            if not self.tts_enabled:
+                self.tts_engine = None
+                return
+            engine = pyttsx3.init()
+            print("[TTS] Engine initialized successfully")
+            with self.tts_lock:
+                engine.setProperty("rate", self.speech_rate)
+                engine.setProperty("volume", self.speech_volume)
+                voices = engine.getProperty("voices")
+                if voices:
+                    chosen_voice = next(
+                        (v for v in voices if "female" in getattr(v, "name", "").lower()), voices[0]
+                    )
+                    engine.setProperty("voice", chosen_voice.id)
+                    self._default_voice = chosen_voice.id
+                self.tts_engine = engine
         except Exception as e:
-            print(f"[{self.name}] TTS failed: {e}")
-            self.tts_enabled = False
+            print(f"[TTS] Error initializing TTS: {e}")
+            self.tts_engine = None
 
-    def _run(self):
-        """Main communication loop with movement reporting"""
-        print(f"[{self.name}] Starting communication with movement reporting...")
-        
-        while self._running:
+    def _natural_pause(self, text: str):
+        if re.search(r'[.!?]$', text.strip()):
+            time.sleep(0.3)
+        elif re.search(r'[,:;]$', text.strip()):
+            time.sleep(0.15)
+
+    def _tts_worker(self):
+        """Background TTS worker to speak messages with optional delay"""
+        speech_delay = 2.0  # lag for non-critical messages
+        while self.tts_worker_running:
             try:
-                current_time = time.time()
-                
-                # Process urgent messages first
-                if not self.urgent_queue.empty():
-                    try:
-                        message = self.urgent_queue.get_nowait()
-                        self._speak(message)
-                    except queue.Empty:
-                        pass
-                
-                # Process regular messages
-                if not self.tts_queue.empty():
-                    try:
-                        message = self.tts_queue.get_nowait()
-                        self._speak(message)
-                    except queue.Empty:
-                        pass
-                
-                # Continuous movement and distance reporting
-                self._report_movement_and_changes(current_time)
-                
-                time.sleep(0.05)
-                
+                audio_msg: AudioMessage = self.audio_queue.get(timeout=0.1)
+                if not self.tts_engine or not self.tts_enabled:
+                    continue
+                if self._should_speak(audio_msg):
+                    with self.tts_lock:
+                        if audio_msg.priority >= 4:  # critical interrupt
+                            try:
+                                self.tts_engine.stop()
+                            except Exception:
+                                pass
+                        else:
+                            time.sleep(speech_delay)
+
+                        self.tts_engine.say(audio_msg.text)
+                        self._natural_pause(audio_msg.text)
+                        self.tts_engine.runAndWait()  # ensures audio is played
+
+                    self.last_spoken_message = audio_msg.text
+                    self.last_spoken_time = time.time()
+            except Empty:
+                continue
             except Exception as e:
-                print(f"[{self.name}] Error: {e}")
-                time.sleep(0.1)
-        
-        print(f"[{self.name}] Communication loop stopped")
+                print(f"[TTS] Worker error: {e}")
 
-    def handle_navigation_message(self, message: Message):
-        """Handle navigation instructions"""
-        instruction = message.data.get('instruction', '')
-        priority = message.priority
-        
-        if instruction and instruction != self.current_instruction:
-            print(f"[{self.name}] 🎯 {instruction}")
-            
-            with self.display_lock:
-                self.current_instruction = instruction
-            
-            if priority >= 3:
-                self.urgent_queue.put(instruction)
-            else:
-                self.tts_queue.put(instruction)
-
-    def handle_system_message(self, message: Message):
-        """Handle system status with movement information"""
-        if message.type == MessageType.SYSTEM_STATUS:
-            data = message.data
-            if data.get('status') == 'perception_update':
-                with self.display_lock:
-                    self.closest_object = data.get('closest_object')
-                    
-                    # Check for movement in the environment
-                    if data.get('movement_detected', False):
-                        print(f"[{self.name}] Movement detected in scene")
-
-    def handle_obstacle_message(self, message: Message):
-        """Handle obstacle alerts with movement context"""
-        obstacle_data = message.data
-        distance = obstacle_data.get('distance', 0)
-        direction = obstacle_data.get('direction', 'ahead')
-        is_moving = obstacle_data.get('is_moving', False)
-        movement_type = obstacle_data.get('movement_type', 'stationary')
-        
-        # Create context-aware alert message
-        if is_moving:
-            if movement_type == 'moving':
-                alert_msg = f"Moving object {direction} at {distance} meters"
-            elif movement_type == 'changing_distance':
-                if distance < self.last_reported_distance if self.last_reported_distance else distance:
-                    alert_msg = f"Object approaching {direction} now at {distance} meters"
-                else:
-                    alert_msg = f"Object moving away {direction} now at {distance} meters"
-            else:
-                alert_msg = f"Object {direction} at {distance} meters"
-        else:
-            alert_msg = f"Stationary object {direction} at {distance} meters"
-        
-        self.urgent_queue.put(alert_msg)
-
-    def _report_movement_and_changes(self, current_time: float):
-        """Report movement and distance changes"""
-        with self.display_lock:
-            closest_obj = self.closest_object
-        
-        if not closest_obj:
-            # No object detected
-            if self.last_object_state != "clear":
-                message = "Path clear, no objects detected"
-                self.tts_queue.put(message)
-                self.last_object_state = "clear"
-                self.last_reported_distance = None
-                self.last_reported_direction = None
-            return
-        
-        distance = closest_obj.get('distance', 0)
-        direction = closest_obj.get('direction', 'ahead')
-        is_moving = closest_obj.get('is_moving', False)
-        distance_changed = closest_obj.get('distance_changed', False)
-        direction_changed = closest_obj.get('direction_changed', False)
-        
-        # Check if we should report (time-based or change-based)
-        should_report = False
-        report_message = ""
-        
-        # Report based on changes
-        if distance_changed or direction_changed:
-            if is_moving:
-                if distance < (self.last_reported_distance or 10):
-                    report_message = f"Object moving closer {direction}, now {distance} meters"
-                else:
-                    report_message = f"Object moving away {direction}, now {distance} meters"
-            else:
-                report_message = f"Object {direction} at {distance} meters"
-            should_report = True
-        
-        # Report moving objects periodically
-        elif is_moving and (current_time - self.last_movement_report >= self.movement_report_interval):
-            report_message = f"Moving object {direction} at {distance} meters"
-            should_report = True
-            self.last_movement_report = current_time
-        
-        # Report significant distance changes
-        elif (self.last_reported_distance is not None and 
-              abs(distance - self.last_reported_distance) > 0.5):
-            if distance < self.last_reported_distance:
-                report_message = f"Object getting closer, now {distance} meters"
-            else:
-                report_message = f"Object moving away, now {distance} meters"
-            should_report = True
-        
-        # Report if this is a new object state
-        current_state = f"{direction}_{distance:.1f}"
-        if current_state != self.last_object_state:
-            if not should_report:  # Only report if not already reporting
-                report_message = f"Object {direction} at {distance} meters"
-                should_report = True
-        
-        # Speak the report if needed
-        if should_report and report_message:
-            self.tts_queue.put(report_message)
-            print(f"[{self.name}] 📢 {report_message}")
-            
-            # Update tracking state
-            self.last_reported_distance = distance
-            self.last_reported_direction = direction
-            self.last_object_state = current_state
-
-    def _speak(self, message: str):
-        """Speak message"""
-        if not self.tts_enabled or not self.tts_engine:
-            return
-        
+        # Stop engine when exiting
         try:
-            self.tts_engine.say(message)
-            self.tts_engine.runAndWait()
-        except Exception as e:
-            print(f"[{self.name}] TTS error: {e}")
+            if self.tts_engine:
+                with self.tts_lock:
+                    self.tts_engine.stop()
+        except Exception:
+            pass
 
-    def process_frame(self, frame: np.ndarray, detections: List[Dict[str, Any]]) -> np.ndarray:
-        """Create display with movement information"""
-        display_frame = frame.copy()
-        height, width = display_frame.shape[:2]
-        
-        # Draw detections with movement info
-        for detection in detections:
-            bbox = detection.get('bbox', [])
-            if len(bbox) == 4:
-                x, y, w, h = bbox
-                
-                # Color based on movement
-                if detection.get('is_moving', False):
-                    color = (0, 165, 255)  # Orange for moving objects
-                    thickness = 3
-                elif detection.get('is_closest', False):
-                    color = (0, 0, 255)  # Red for closest
-                    thickness = 3
-                else:
-                    color = (0, 255, 0)  # Green for stationary
-                    thickness = 1
-                
-                cv2.rectangle(display_frame, (x, y), (x + w, y + h), color, thickness)
-                
-                # Label with distance and movement info
-                distance = detection.get('distance', 0)
-                label = f"{distance:.1f}m"
-                if detection.get('is_moving', False):
-                    label += " MOVING"
-                
-                cv2.putText(display_frame, label, (x, y - 10), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-        
-        # Draw UI
-        self._draw_movement_ui(display_frame)
-        
-        return display_frame
+    def _should_speak(self, audio_msg: AudioMessage) -> bool:
+        now = time.time()
+        if audio_msg.priority >= 3:
+            return True
+        if now - self.last_spoken_time < self.delay_seconds:
+            return False
+        return True
 
-    def _draw_movement_ui(self, frame: np.ndarray):
-        """Draw movement-aware user interface"""
-        height, width = frame.shape[:2]
-        
-        # Top status bar
-        cv2.rectangle(frame, (0, 0), (width, 40), (0, 0, 0), -1)
-        
-        with self.display_lock:
-            closest_obj = self.closest_object
-            instruction = self.current_instruction
-        
-        # Status text
-        if closest_obj:
-            distance = closest_obj.get('distance', 0)
-            direction = closest_obj.get('direction', 'ahead')
-            is_moving = closest_obj.get('is_moving', False)
-            
-            if is_moving:
-                status_text = f"MOVING OBJECT {direction} at {distance}m"
-                color = (0, 165, 255)  # Orange
+    # -------------------- Scenario --------------------
+    def _check_periodic_status(self):
+        current_time = time.time()
+        detection_state = tuple(sorted(self.current_detection_summary.items()))
+        if detection_state != self.last_detection_state:
+            self.last_detection_state = detection_state
+            critical = self.current_detection_summary.get("critical", 0)
+            warning = self.current_detection_summary.get("warning", 0)
+            caution = self.current_detection_summary.get("caution", 0)
+            safe = self.current_detection_summary.get("safe", 0)
+            if critical > 0:
+                message, priority = f"{critical} critical obstacle(s)! Stop!", 4
+            elif warning > 0:
+                message, priority = f"{warning} obstacle(s) in warning zone.", 3
+            elif caution > 0:
+                message, priority = f"{caution} object(s) caution zone.", 2
+            elif safe > 0:
+                message, priority = f"{safe} safe objects detected.", 1
             else:
-                status_text = f"OBJECT {direction} at {distance}m"
-                color = (0, 0, 255)  # Red
-        else:
-            status_text = "NO OBJECTS DETECTED"
-            color = (0, 255, 0)  # Green
-        
-        cv2.putText(frame, status_text, (10, 25), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-        
-        # FPS
-        fps = self._get_fps()
-        cv2.putText(frame, f"FPS: {fps}", (width - 80, 25),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-        
-        # Current instruction
-        if instruction:
-            cv2.rectangle(frame, (0, height-40), (width, height), (0, 0, 0), -1)
-            cv2.putText(frame, instruction, (10, height-10), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                message, priority = "No obstacles detected.", 1
+            self.audio_queue.put(AudioMessage(message, priority, current_time))
+            self.visual_alerts.append(self._create_visual_alert(f"STATUS: {message}", "info", 3.0))
+            return
+        if current_time - self.last_status_update >= self.status_update_interval:
+            self.last_status_update = current_time
+            self.audio_queue.put(AudioMessage("System monitoring active.", 1, current_time))
 
-    def _get_fps(self) -> int:
-        """Get FPS"""
-        if not hasattr(self, 'fps_counter'):
-            self.fps_counter = 0
-            self.fps_timer = time.time()
-            self.last_fps = 0
-            
-        self.fps_counter += 1
-        if time.time() - self.fps_timer >= 1.0:
-            self.last_fps = self.fps_counter
-            self.fps_counter = 0
-            self.fps_timer = time.time()
-            
-        return self.last_fps
+    # -------------------- Alerts / Drawing --------------------
+    def _create_visual_alert(self, message: str, alert_type: str, duration: float = None) -> VisualAlert:
+        if duration is None:
+            duration = self.display_config.get("alert_duration", 4.0)
+        pos_map = {"critical": (10, 30), "warning": (10, 60), "info": (10, 90), "success": (10, 120)}
+        return VisualAlert(message, alert_type, duration, pos_map.get(alert_type, (10, 30)), time.time())
 
-    def send_user_message(self, message: str, priority: int = 1):
-        """Send user message"""
-        if priority >= 3:
-            self.urgent_queue.put(message)
+    def _process_obstacle_alert(self, data: Dict[str, Any]):
+        obj = data.get("object", "obstacle")
+        direction = data.get("direction", "ahead")  # 'ahead', 'left', 'right', 'back'
+        lvl = data.get("warning_level", "safe")
+        if lvl == "safe":
+            return
+
+        msg_prefix = "Obstacle behind! " if direction == "back" else ""
+
+        if lvl == "critical":
+            msg, typ, dur = f"{msg_prefix}Stop! {obj} very close {direction}!", "critical", 2.0
+        elif lvl == "warning":
+            msg, typ, dur = f"{msg_prefix}Warning! {obj} approaching {direction}!", "warning", 3.0
+        elif lvl == "caution":
+            msg, typ, dur = f"{msg_prefix}Caution, {obj} detected {direction}", "warning", 4.0
         else:
-            self.tts_queue.put(message)
+            return
+
+        alert = self._create_visual_alert(msg, typ, dur)
+        alert.spoken = False
+        self.visual_alerts.append(alert)
+        # Push to TTS
+        self.audio_queue.put(AudioMessage(msg, 3 if lvl != "safe" else 1, time.time()))
+
+    def _process_navigation_update(self, data: Dict[str, Any]):
+        t = data.get("instruction_type", "proceed")
+        d = data.get("direction", "forward")
+        if t == "stop":
+            msg, pr, typ = "Stop immediately!", 4, "critical"
+        elif t == "avoid":
+            msg, pr, typ = f"Move {d} to avoid obstacle", 3, "warning"
+        elif t == "turn":
+            msg, pr, typ = f"Turn {d}", 2, "info"
+        else:
+            msg, pr, typ = "Path clear, proceed", 1, "success"
+        if pr >= 2:
+            self.audio_queue.put(AudioMessage(msg, pr, time.time()))
+        self.visual_alerts.append(self._create_visual_alert(msg, typ, 3.0))
+
+    def process_frame(self, frame: np.ndarray, detections: List[Dict[str, Any]] = None) -> np.ndarray:
+        if frame is None:
+            return None
+        processed = self._update_visual_display(frame)
+        if detections:
+            self._draw_detections(processed, detections)
+        return processed
+
+    def _update_visual_display(self, frame: np.ndarray) -> np.ndarray:
+        if not self.visual_enabled:
+            return frame
+        current_time = time.time()
+        self.visual_alerts = [a for a in self.visual_alerts if current_time - a.timestamp < a.duration]
+        disp = frame.copy()
+        for a in self.visual_alerts:
+            self._draw_alert(disp, a)
+        return disp
+
+    def _draw_alert(self, frame: np.ndarray, alert: VisualAlert):
+        colors = {"critical": (0, 0, 255), "warning": (0, 165, 255), "info": (255, 255, 0), "success": (0, 255, 0)}
+        color = colors.get(alert.alert_type, (255, 255, 255))
+        x, y = alert.position
+        cv2.putText(frame, alert.message, (x, y), cv2.FONT_HERSHEY_SIMPLEX,
+                    float(self.display_config["font_scale"]), color, int(self.display_config["font_thickness"]))
+
+    def _draw_detections(self, frame: np.ndarray, detections: List[Dict[str, Any]]):
+        for det in detections:
+            bbox = det.get("bbox")
+            if not bbox or len(bbox) != 4:
+                continue
+            x1, y1, x2, y2 = map(int, bbox)
+            obj_class = det.get("object", "unknown")
+            confidence = det.get("confidence", 0.0)
+            warning_level = det.get("warning_level", "safe")
+            distance = det.get("distance", 0.0)
+            color_map = {"critical": (0, 0, 255), "warning": (0, 165, 255),
+                         "caution": (0, 255, 255), "safe": (0, 255, 0)}
+            color = color_map.get(warning_level, (255, 255, 255))
+            thickness = 3 if warning_level == "critical" else 2
+            h, w = frame.shape[:2]
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(w - 1, x2), min(h - 1, y2)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
+            label = f"{obj_class} {distance:.1f}m ({confidence:.2f})"
+            cv2.putText(frame, label, (x1, max(0, y1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, thickness)
+            if warning_level != "safe":
+                cv2.putText(frame, warning_level.upper(), (x1, min(h - 1, y2 + 15)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+    # -------------------- Run Loop --------------------
+    def _run(self):
+        print(f"[{self.name}] Starting communication loop")  # FIX: Use self.name
+        while getattr(self, "_running", True):
+            try:
+                self._check_periodic_status()
+                time.sleep(0.1)
+            except Exception as e:
+                print(f"[{self.name}] Error in loop: {e}")  # FIX: Use self.name
+        self.tts_worker_running = False
+        if self.tts_worker_thread.is_alive():
+            self.tts_worker_thread.join(timeout=1.0)
+        with self.tts_lock:
+            if self.tts_engine:
+                try:
+                    self.tts_engine.stop()
+                except Exception:
+                    pass
+        print(f"[{self.name}] Communication loop stopped")  # FIX: Use self.name
+
+    # -------------------- Message Handling --------------------
+    def handle_message(self, message: Message):
+        try:
+            # FIX: Use message.type instead of message.msg_type
+            if message.type == MessageType.OBSTACLE_ALERT:
+                self._process_obstacle_alert(message.data)
+            elif message.type == MessageType.NAVIGATION_UPDATE:
+                self._process_navigation_update(message.data)
+            elif message.type == MessageType.USER_COMMUNICATION:
+                d = message.data
+                self.send_user_message(d.get("message", ""), d.get("priority", 2), d.get("voice_settings"))
+            elif message.type == MessageType.SYSTEM_STATUS:
+                d = message.data
+                if d.get("command") == "stop":
+                    self.stop()
+                elif d.get("status") == "error":
+                    self.send_user_message(f"Error: {d.get('message', 'System error')}", priority=3)
+                elif d.get("status") == "perception_update":
+                    if d.get("detection_summary"):
+                        self.current_detection_summary = d["detection_summary"]
+        except Exception as e:
+            print(f"[{self.name}] Error handling message: {e}")  # FIX: Use self.name
+
+    # -------------------- Send User Message --------------------
+    def send_user_message(self, message: str, priority: int = 2, voice_settings: Dict[str, Any] = None):
+        """Send a message to the user via TTS and visual display"""
+        audio_msg = AudioMessage(
+            text=message,
+            priority=priority,
+            timestamp=time.time(),
+            voice_settings=voice_settings
+        )
+        self.audio_queue.put(audio_msg)
+        alert_type = "critical" if priority >= 4 else "warning" if priority >= 3 else "info"
+        self.visual_alerts.append(self._create_visual_alert(message, alert_type))
